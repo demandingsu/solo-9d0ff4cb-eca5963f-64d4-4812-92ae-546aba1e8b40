@@ -1,0 +1,36 @@
+services:
+  api:
+    build: .
+    image: pv-backtest-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（挂卷后可跨重启保留）
+      APP_DB_PATH: /data/app.db
+    volumes:
+      - pvdata:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 可选的第二个服务进程，与 api 共享同一个 SQLite 数据卷，用于验证
+  # “生成与另一进程导入交错”时的快照隔离：两边都通过 BEGIN IMMEDIATE
+  # 写事务串行化，生成读到的一定是同一个已提交快照。
+  # 启动方式：docker compose --profile multi up -d
+  api2:
+    build: .
+    image: pv-backtest-api
+    profiles: ["multi"]
+    ports:
+      - "8001:8000"
+    environment:
+      APP_DB_PATH: /data/app.db
+    volumes:
+      - pvdata:/data
+    restart: unless-stopped
+
+volumes:
+  pvdata:
