@@ -1,4 +1,4 @@
-"""FastAPI 入口：预报/实测 CSV 导入、回测样本数据集生成与查询。"""
+"""FastAPI 入口：预报/实测 CSV 导入、回测样本数据集生成与查询、训练/验证划分。"""
 from __future__ import annotations
 
 import json
@@ -34,8 +34,16 @@ GENERATE_EXAMPLE = {
     "lead_hours": 24,
 }
 
+SPLIT_EXAMPLE = {
+    "dataset_ids": ["demo-20260301"],
+    "validation_start_hour": "2026-03-01T01:00:00Z",
+    "validation_end_hour": "2026-03-01T02:00:00Z",
+    "gap_hours": 1,
+}
+
 API_DESCRIPTION = """
-光伏回测样本服务：把历史辐照预报与实测发电量配成回测样本，**保证事后发布的预报不会进入样本**。
+光伏回测样本服务：把历史辐照预报与实测发电量配成回测样本，**保证事后发布的预报不会进入样本**；
+并可把多份已保存数据集合并成**训练/验证划分**，保证同一小时的预测不会泄漏到验证侧。
 
 ## 使用流程
 
@@ -43,6 +51,8 @@ API_DESCRIPTION = """
 2. `POST /imports/actuals` 导入实测 CSV（场站、目标小时、电量）。
 3. `POST /datasets/{数据集号}/generate` 指定场站、目标小时区间、提前小时数生成配对结果并保存。
 4. `GET /datasets/{数据集号}` 随时读回已保存的结果。
+5. `POST /splits/{划分号}` 把同一场站的多份数据集合并，按验证区间+隔离小时数划分训练/验证索引。
+6. `GET /splits/{划分号}` 随时读回已保存的划分。
 
 ## 配对与迟到预报规则
 
@@ -59,26 +69,36 @@ API_DESCRIPTION = """
 | `no_forecast+no_actual` | 两者均缺 |
 | `null` | 配对成功 |
 
+## 训练/验证划分规则
+
+- 只取各数据集中**配对成功**的行；缺配行计入 `dropped_unpaired`。
+- 同一目标小时、同一提前量出现在多份数据集：来源时刻、辐照、电量一致则**去重**，
+  来源数据集号并入 `source_dataset_ids`；任一不一致则**整次报 409 冲突**，划分不落库。
+- 目标小时落在验证区间（含两端）→ 验证侧；落在区间两端各 `gap_hours` 的隔离带内 →
+  剔除（不进训练也不进验证，计入 `dropped_gap`）；其余 → 训练侧。
+- 侧别只由目标小时决定，因此**同一小时的不同提前量必然同侧**，不会泄漏。
+
 ## 导入幂等与整批拒收
 
 - 同键同值重复导入：幂等跳过（`skipped_duplicates`）。
 - 同键异值（批内或与本库已有数据冲突）：**整批拒收**（409），一行都不会写入。
 - 行格式错误：整批拒收（422），并逐行列出原因。
 
-## 数据集号语义
+## 数据集号 / 划分号语义
 
-- 同一数据集号 + 相同参数重试：直接读回首次保存的结果（`replayed=true`），即使期间又有新数据导入。
-- 同一数据集号 + 不同参数：409 冲突，返回已存参数与请求参数。
+- 同一编号 + 相同参数重试：直接读回首次保存的结果（`replayed=true`），即使期间又有新数据导入。
+- 同一编号 + 不同参数：409 冲突，返回已存参数与请求参数。
 
 ## 快照隔离
 
-生成在一个 `BEGIN IMMEDIATE` 写事务内完成：事务期间其他进程的导入无法提交，
+生成与划分都在一个 `BEGIN IMMEDIATE` 写事务内完成：事务期间其他进程的写入无法提交，
 整份结果必然来自**同一个已提交快照**；任一环节失败即整体回滚，不会留下可见的半份结果。
 """
 
 TAGS = [
     {"name": "imports", "description": "CSV 导入（整批原子，同键异值拒收）"},
     {"name": "datasets", "description": "回测样本数据集：生成、幂等重试、查询"},
+    {"name": "splits", "description": "训练/验证划分：合并多份数据集、隔离带防泄漏、幂等重试"},
     {"name": "meta", "description": "服务信息"},
 ]
 
@@ -108,10 +128,31 @@ class GenerateParams(BaseModel):
     lead_hours: int = Field(ge=0, le=24 * 90, description="提前小时数：只采用 目标小时-lead_hours 之前发布的预报", examples=[24])
 
 
+class SplitParams(BaseModel):
+    dataset_ids: list[str] = Field(
+        min_length=1, max_length=500,
+        description="参与合并的数据集号（须属于同一场站；去重排序后保存，顺序/重复不影响参数判定）",
+        examples=[["demo-20260301"]],
+    )
+    validation_start_hour: str = Field(description="验证区间起始 UTC 小时（整点，含）", examples=["2026-03-01T01:00:00Z"])
+    validation_end_hour: str = Field(description="验证区间结束 UTC 小时（整点，含）", examples=["2026-03-01T02:00:00Z"])
+    gap_hours: int = Field(
+        ge=0, le=24 * 90,
+        description="隔离小时数：验证区间两端各这么宽的小时带不进训练（也不进验证），防止相邻小时泄漏",
+        examples=[1],
+    )
+
+
 DATASET_ID_PATH = Path(
     pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
     description="数据集号（字母数字开头，可含 . _ -）",
     examples=["demo-20260301"],
+)
+
+SPLIT_ID_PATH = Path(
+    pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    description="划分号（字母数字开头，可含 . _ -）",
+    examples=["split-20260301"],
 )
 
 
@@ -211,6 +252,9 @@ def root():
             "POST /datasets/{dataset_id}/generate",
             "GET /datasets",
             "GET /datasets/{dataset_id}",
+            "POST /splits/{split_id}",
+            "GET /splits",
+            "GET /splits/{split_id}",
         ],
     }
 
@@ -436,4 +480,164 @@ def get_dataset(dataset_id: str):
         conn.close()
     if row is None:
         raise HTTPException(status_code=404, detail={"message": f"数据集 {dataset_id!r} 不存在"})
+    return json.loads(row["result_json"])
+
+
+# ---------------------------------------------------------------- 路由：训练/验证划分
+
+@app.post(
+    "/splits/{split_id}",
+    tags=["splits"],
+    summary="合并多份数据集并创建训练/验证划分",
+    description=(
+        "在单个写事务内读取同一已提交快照：只取配对成功的行；同一目标小时+提前量跨数据集"
+        "同值去重（来源号并入 source_dataset_ids），异值整次报 409；验证区间内的小时进验证侧，"
+        "区间两端各 gap_hours 隔离带内的小时不进训练；同一小时的不同提前量始终同侧。"
+        "同号同参数重试读回原结果（replayed=true）；同号异参数返回 409。"
+        "失败整体回滚，不留半份划分。"
+    ),
+    responses={
+        409: {"description": "划分号已存在且参数不同，或跨数据集同键样本取值不一致"},
+        422: {"description": "参数非法（数据集不存在、场站不一致、未整点、区间倒置等）"},
+        503: {"description": "数据库被其他写入占用，可重试"},
+    },
+)
+def create_split(
+    params: SplitParams = Body(
+        openapi_examples={
+            "首次划分": {
+                "summary": "首次划分（配合 /datasets 的示例数据集）",
+                "description": (
+                    "把 demo-20260301 数据集中配对成功的行按小时分侧：01、02 时进验证侧；"
+                    "隔离 1 小时使 00、03 时不进训练（dropped_gap）；缺配行计入 dropped_unpaired。"
+                ),
+                "value": SPLIT_EXAMPLE,
+            },
+            "同号同参数重试": {
+                "summary": "同号同参数重试 → 读回原结果",
+                "description": (
+                    "用同一 split_id 再次提交完全相同的参数（dataset_ids 顺序/重复不影响判定）："
+                    "即使期间又导入了新数据、生成了新数据集，也直接读回首次保存的划分，replayed=true。"
+                ),
+                "value": SPLIT_EXAMPLE,
+            },
+            "同号异参数冲突": {
+                "summary": "同号异参数 → 409 冲突",
+                "description": "同一 split_id 换用 gap_hours=2 等任何不同参数，返回 409 及已存参数。",
+                "value": {**SPLIT_EXAMPLE, "gap_hours": 2},
+            },
+        },
+    ),
+    split_id: str = SPLIT_ID_PATH,
+):
+    try:
+        canon_params, val_start_dt, val_end_dt = logic.normalize_split_params(
+            params.dataset_ids, params.validation_start_hour,
+            params.validation_end_hour, params.gap_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+
+    conn = db.connect(app.state.db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute(
+            "SELECT params_json, result_json FROM splits WHERE split_id = ?",
+            (split_id,),
+        ).fetchone()
+        if existing is not None:
+            stored_params = json.loads(existing["params_json"])
+            if stored_params == canon_params:
+                result = json.loads(existing["result_json"])
+                _commit(conn)
+                result["replayed"] = True
+                return result
+            conn.execute("ROLLBACK")
+            raise HTTPException(status_code=409, detail={
+                "message": "划分号已存在且参数不同，未覆盖",
+                "split_id": split_id,
+                "existing_params": stored_params,
+                "requested_params": canon_params,
+            })
+
+        try:
+            train, validation, summary = logic.build_split(
+                conn, canon_params["dataset_ids"], val_start_dt, val_end_dt,
+                canon_params["gap_hours"],
+            )
+        except ValueError as exc:  # 数据集不存在 / 场站不一致
+            conn.execute("ROLLBACK")
+            raise HTTPException(status_code=422, detail={"message": str(exc)})
+        except logic.SplitConflictError as exc:
+            conn.execute("ROLLBACK")
+            raise HTTPException(status_code=409, detail={
+                "message": "同一目标小时+提前量在不同数据集中的来源时刻、辐照或电量不一致，"
+                           "整次划分未保存",
+                "conflicts": exc.conflicts,
+            })
+
+        if logic.SNAPSHOT_TEST_HOOK is not None:  # 测试钩子：验证快照隔离，生产为空
+            logic.SNAPSHOT_TEST_HOOK()
+
+        created_at = logic.canon(datetime.now(timezone.utc))
+        result = {
+            "split_id": split_id,
+            "created_at": created_at,
+            "params": canon_params,
+            "summary": summary,
+            "train": train,
+            "validation": validation,
+        }
+        conn.execute(
+            "INSERT INTO splits (split_id, params_json, result_json, created_at) VALUES (?, ?, ?, ?)",
+            (split_id, json.dumps(canon_params, sort_keys=True), json.dumps(result), created_at),
+        )
+        _commit(conn)
+        result["replayed"] = False
+        return result
+    except HTTPException:
+        raise
+    except sqlite3.OperationalError as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        _locked_to_503(exc)
+        raise
+    finally:
+        conn.close()
+
+
+@app.get("/splits", tags=["splits"], summary="列出已保存的划分")
+def list_splits():
+    conn = db.connect(app.state.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT split_id, params_json, created_at FROM splits ORDER BY created_at, split_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"split_id": r["split_id"], "params": json.loads(r["params_json"]), "created_at": r["created_at"]}
+        for r in rows
+    ]
+
+
+@app.get(
+    "/splits/{split_id}",
+    tags=["splits"],
+    summary="读回划分结果",
+    responses={404: {"description": "划分不存在"}},
+)
+def get_split(split_id: str):
+    conn = db.connect(app.state.db_path)
+    try:
+        row = conn.execute(
+            "SELECT result_json FROM splits WHERE split_id = ?", (split_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"message": f"划分 {split_id!r} 不存在"})
     return json.loads(row["result_json"])

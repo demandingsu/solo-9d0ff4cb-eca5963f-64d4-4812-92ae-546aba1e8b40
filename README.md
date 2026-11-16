@@ -3,13 +3,15 @@
 把历史辐照预报与实测发电量配成回测样本的 API 服务（FastAPI + SQLite）。
 核心保证：**事后发布（迟到）的预报不会进入样本**；生成结果来自同一个已提交快照；
 同数据集号重试幂等；导入同键异值整批拒收。
+新增**训练/验证划分**：把同一场站的多份已保存数据集合并成训练/验证索引，
+按验证区间+隔离小时数防止同一小时的预测泄漏到验证侧。
 
 ## 快速开始
 
 ```bash
 docker compose up --build -d
 curl http://localhost:8000/health
-# 交互式文档（含迟到预报、重试、冲突示例，可直接在页面里执行）
+# 交互式文档（含迟到预报、重试、冲突、划分示例，可直接在页面里执行）
 open http://localhost:8000/docs
 ```
 
@@ -24,7 +26,7 @@ docker compose --profile multi up -d   # api:8000 与 api2:8001 共用 /data/app
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                  # 13 个端到端测试
+pytest                                  # 25 个端到端测试
 uvicorn app.main:app --reload           # 数据库默认写到 ./data/app.db
 ```
 
@@ -37,6 +39,9 @@ uvicorn app.main:app --reload           # 数据库默认写到 ./data/app.db
 | POST | `/datasets/{数据集号}/generate` | 生成回测样本并保存 |
 | GET | `/datasets/{数据集号}` | 读回已保存结果 |
 | GET | `/datasets` | 列出全部数据集 |
+| POST | `/splits/{划分号}` | 合并多份数据集，创建训练/验证划分 |
+| GET | `/splits/{划分号}` | 读回已保存的划分 |
+| GET | `/splits` | 列出全部划分 |
 | GET | `/health` | 健康检查 |
 
 ## CSV 格式
@@ -87,6 +92,35 @@ ST01,2026-03-01T00:00:00Z,48.2
 - **同号同参数重试**：直接读回首次保存的结果（`replayed=true`），即使期间又导入了新数据。
 - **同号异参数**：409，响应带回已存参数与请求参数，不覆盖。
 
+## 训练/验证划分
+
+`POST /splits/{划分号}` 把同一场站的多份已保存数据集合并成训练/验证索引，参数：
+
+```json
+{
+  "dataset_ids": ["demo-20260301", "demo-20260301-l48"],
+  "validation_start_hour": "2026-03-01T01:00:00Z",
+  "validation_end_hour": "2026-03-01T02:00:00Z",
+  "gap_hours": 1
+}
+```
+
+规则：
+
+- **只取配对成功的行**；缺配行计入 `dropped_unpaired`。
+- **跨数据集去重**：同一目标小时、同一提前量出现在多份数据集时，来源时刻、辐照、电量
+  一致则合并为一条，来源号并入 `source_dataset_ids`；任一不一致则**整次报 409 冲突**，
+  划分不落库（典型场景：两份数据集生成之间又导入过更晚发布但仍合格的预报）。
+- **分侧只按目标小时**：落在验证区间（含两端）→ 验证侧；落在区间两端各 `gap_hours`
+  的隔离带内 → 剔除（不进训练也不进验证，计入 `dropped_gap`）；其余 → 训练侧。
+  因此同一小时的不同提前量必然同侧，不会泄漏。
+- `dataset_ids` 去重排序后保存：同一批数据集换顺序、重复提交都视为同一参数。
+
+响应含 `train` / `validation` 两侧样本（目标小时、提前量、截止与来源时刻、辐照、电量、
+来源数据集号）及 `summary` 各项计数。划分号语义与数据集号一致：同号同参数重试读回原结果
+（`replayed=true`），同号异参数 409；结果固定于创建时已提交的数据集快照，失败不留半份划分。
+`GET /splits`、`GET /splits/{划分号}` 可随时读回。
+
 ## 一致性与原子性
 
 - 导入与生成都在 `BEGIN IMMEDIATE` 写事务中执行：事务开始即持有写锁，
@@ -131,6 +165,14 @@ curl -X POST http://localhost:8000/datasets/demo-20260301/generate \
 curl -X POST http://localhost:8000/datasets/demo-20260301/generate \
   -H 'Content-Type: application/json' \
   -d '{"station":"ST01","start_hour":"2026-03-01T00:00:00Z","end_hour":"2026-03-01T03:00:00Z","lead_hours":12}'
+
+# 6. 划分：01/02 时进验证侧，隔离 1 小时使 00/03 时不进训练
+curl -X POST http://localhost:8000/splits/split-20260301 \
+  -H 'Content-Type: application/json' \
+  -d '{"dataset_ids":["demo-20260301"],"validation_start_hour":"2026-03-01T01:00:00Z","validation_end_hour":"2026-03-01T02:00:00Z","gap_hours":1}'
+
+# 7. 读回划分
+curl http://localhost:8000/splits/split-20260301
 ```
 
 ## 项目结构
@@ -138,10 +180,11 @@ curl -X POST http://localhost:8000/datasets/demo-20260301/generate \
 ```
 app/
   main.py    # FastAPI 路由、/docs 示例、事务边界
-  logic.py   # 时间规范化、CSV 解析、配对逻辑
+  logic.py   # 时间规范化、CSV 解析、配对逻辑、训练/验证划分
   db.py      # SQLite 连接（WAL、busy_timeout）与建表
 tests/
-  test_api.py  # 13 个端到端测试（含快照隔离、失败回滚）
+  test_api.py     # 13 个端到端测试（导入、配对、幂等、快照隔离、失败回滚）
+  test_splits.py  # 12 个划分测试（合并去重、冲突、隔离带、幂等、快照隔离、回滚）
 Dockerfile
 docker-compose.yml
 ```

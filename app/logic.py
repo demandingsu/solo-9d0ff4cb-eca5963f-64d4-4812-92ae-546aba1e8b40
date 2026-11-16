@@ -1,8 +1,9 @@
-"""业务逻辑：时间规范化、CSV 解析、预报-实测配对。"""
+"""业务逻辑：时间规范化、CSV 解析、预报-实测配对、训练/验证划分。"""
 from __future__ import annotations
 
 import csv
 import io
+import json
 import math
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from typing import Callable, Optional
 
 CANON_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-# 测试专用钩子：在生成事务持有写锁期间被调用，用于验证快照隔离。生产环境保持 None。
+# 测试专用钩子：在生成/划分事务持有写锁期间被调用，用于验证快照隔离。生产环境保持 None。
 SNAPSHOT_TEST_HOOK: Optional[Callable[[], None]] = None
 
 # 生成区间上限（约 5 年的小时数），防止误传超大区间。
@@ -285,3 +286,169 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
         "missing_both": sum(1 for r in rows if r["missing_reason"] == MISSING_BOTH),
     }
     return rows, summary
+
+
+# ---------------------------------------------------------------- 训练/验证划分
+
+class SplitConflictError(Exception):
+    """同一目标小时+提前量在不同数据集中的取值（来源时刻/辐照/电量）不一致。
+
+    携带 conflicts 明细；调用方应整次放弃划分（不落库）并返回 409。
+    """
+
+    def __init__(self, conflicts):
+        super().__init__("同一目标小时+提前量在不同数据集中的取值不一致")
+        self.conflicts = conflicts
+
+
+def normalize_split_params(dataset_ids, validation_start_hour, validation_end_hour, gap_hours):
+    """校验并规范化划分参数，返回 (规范参数 dict, 验证起始 dt, 验证结束 dt)。
+
+    dataset_ids 去重并排序：同一批数据集无论提交顺序、是否重复，都视为同一参数。
+    """
+    if not dataset_ids:
+        raise ValueError("dataset_ids 不能为空")
+    norm = []
+    for d in dataset_ids:
+        d = (d or "").strip()
+        if not d:
+            raise ValueError("数据集号不能为空")
+        norm.append(d)
+    unique = sorted(set(norm))
+    start = parse_hour(validation_start_hour)
+    end = parse_hour(validation_end_hour)
+    if end < start:
+        raise ValueError("validation_end_hour 早于 validation_start_hour")
+    if gap_hours < 0:
+        raise ValueError("gap_hours 不能为负")
+    params = {
+        "dataset_ids": unique,
+        "validation_start_hour": canon(start),
+        "validation_end_hour": canon(end),
+        "gap_hours": gap_hours,
+    }
+    return params, start, end
+
+
+def build_split(conn, dataset_ids, val_start_dt, val_end_dt, gap_hours):
+    """把多个同场站数据集的配对成功行合并去重，按验证区间+隔离带分到训练/验证两侧。
+
+    - 只取配对成功（missing_reason 为空）的行，缺配行计入 dropped_unpaired；
+    - 同一 (目标小时, 提前量) 出现在多个数据集：来源时刻、辐照、电量一致则去重，
+      来源号并入 source_dataset_ids；任一不一致则抛 SplitConflictError，整次不落库；
+    - 目标小时落在验证区间（含两端）→ 验证侧；落在区间两端各 gap_hours 的隔离带内
+      → 剔除（不进训练也不进验证，计入 dropped_gap）；其余 → 训练侧。
+      侧别只由目标小时决定，因此同一小时的不同提前量必然同侧。
+
+    调用方必须已处于写事务中（BEGIN IMMEDIATE），读到的是同一已提交快照。
+    返回 (train, validation, summary)，两侧均按 (目标小时, 提前量) 排序。
+    """
+    params_by_id = {}
+    missing = []
+    for ds in dataset_ids:
+        row = conn.execute(
+            "SELECT params_json FROM datasets WHERE dataset_id = ?", (ds,)
+        ).fetchone()
+        if row is None:
+            missing.append(ds)
+        else:
+            params_by_id[ds] = json.loads(row["params_json"])
+    if missing:
+        raise ValueError("数据集不存在: " + ", ".join(missing))
+    stations = {p["station"] for p in params_by_id.values()}
+    if len(stations) > 1:
+        detail = ", ".join(f"{d}={params_by_id[d]['station']}" for d in dataset_ids)
+        raise ValueError(f"参与划分的数据集必须属于同一场站（{detail}）")
+
+    by_key: dict[tuple[str, int], list[dict]] = {}
+    unpaired = 0
+    paired = 0
+    for ds in dataset_ids:
+        lead = params_by_id[ds]["lead_hours"]
+        rows = conn.execute(
+            "SELECT target_hour, cutoff_issued_at, issued_at, irradiance, energy, missing_reason "
+            "FROM dataset_rows WHERE dataset_id = ?",
+            (ds,),
+        ).fetchall()
+        for r in rows:
+            if r["missing_reason"] is not None:
+                unpaired += 1
+                continue
+            paired += 1
+            key = (r["target_hour"], lead)
+            by_key.setdefault(key, []).append({
+                "dataset_id": ds,
+                "cutoff_issued_at": r["cutoff_issued_at"],
+                "issued_at": r["issued_at"],
+                "irradiance": r["irradiance"],
+                "energy": r["energy"],
+            })
+
+    samples = []
+    conflicts = []
+    merged_duplicates = 0
+    for (target_hour, lead), entries in sorted(by_key.items()):
+        first = entries[0]
+        if any(
+            e["issued_at"] != first["issued_at"]
+            or e["irradiance"] != first["irradiance"]
+            or e["energy"] != first["energy"]
+            for e in entries[1:]
+        ):
+            conflicts.append({
+                "target_hour": target_hour,
+                "lead_hours": lead,
+                "values": [
+                    {
+                        "dataset_id": e["dataset_id"],
+                        "issued_at": e["issued_at"],
+                        "irradiance": e["irradiance"],
+                        "energy": e["energy"],
+                    }
+                    for e in entries
+                ],
+            })
+            continue
+        merged_duplicates += len(entries) - 1
+        samples.append({
+            "target_hour": target_hour,
+            "lead_hours": lead,
+            "cutoff_issued_at": first["cutoff_issued_at"],
+            "issued_at": first["issued_at"],
+            "irradiance": first["irradiance"],
+            "energy": first["energy"],
+            "source_dataset_ids": sorted(e["dataset_id"] for e in entries),
+        })
+    if conflicts:
+        raise SplitConflictError(conflicts)
+
+    # 规范形 UTC 字符串（等宽）的字典序即时间先后序，可直接比较
+    val_start_s = canon(val_start_dt)
+    val_end_s = canon(val_end_dt)
+    gap = timedelta(hours=gap_hours)
+    gap_lo_s = canon(val_start_dt - gap)
+    gap_hi_s = canon(val_end_dt + gap)
+
+    train, validation = [], []
+    dropped_gap = 0
+    for s in samples:
+        h = s["target_hour"]
+        if val_start_s <= h <= val_end_s:
+            validation.append(s)
+        elif gap_lo_s <= h < val_start_s or val_end_s < h <= gap_hi_s:
+            dropped_gap += 1
+        else:
+            train.append(s)
+
+    summary = {
+        "station": next(iter(stations)),
+        "input_datasets": len(dataset_ids),
+        "paired_rows": paired,
+        "unique_samples": len(samples),
+        "merged_duplicates": merged_duplicates,
+        "train_count": len(train),
+        "validation_count": len(validation),
+        "dropped_gap": dropped_gap,
+        "dropped_unpaired": unpaired,
+    }
+    return train, validation, summary
